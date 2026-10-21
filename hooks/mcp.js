@@ -13,13 +13,27 @@ const jscpd = require('./jscpd');
 let root = jscpd.gitRoot(process.argv[2] || process.env.CLAUDE_PROJECT_DIR || process.cwd());
 let args = ['--mcp', '.'];
 if (root) {
-  args = [...args, ...jscpd.options(root)];
+  const file = path.join(jscpd.dataDir(), `mcp-${process.pid}.json`);
+  fs.mkdirSync(jscpd.dataDir(), { recursive: true });
+  args = [...args, ...jscpd.config(root, file)];
+  process.on('exit', () => fs.rmSync(file, { force: true }));
 } else {
   root = path.join(os.tmpdir(), 'drygate-empty');
   fs.mkdirSync(root, { recursive: true });
 }
 
-// cwd is the repo so the relative ignore globs from options() resolve there.
-const child = spawn(jscpd.command(), args, { cwd: root, stdio: 'inherit', shell: jscpd.shell });
+// Before the first snapshot has installed jscpd, npx fetches it. Installing
+// here instead would hold the server past Claude Code's MCP startup timeout.
+let cmd = jscpd.command({ allowInstall: false });
+if (!cmd) {
+  cmd = 'npx';
+  args = ['--yes', `jscpd@${jscpd.VERSION}`, ...args];
+}
+
+const child = spawn(cmd, args, { cwd: root, stdio: 'inherit', shell: process.platform === 'win32', windowsHide: true });
+child.on('error', (e) => {
+  process.stderr.write(`drygate: could not start jscpd's MCP server: ${e.message}\n`);
+  process.exit(1);
+});
 child.on('exit', (code, signal) => process.exit(signal ? 1 : code));
 for (const sig of ['SIGINT', 'SIGTERM']) process.on(sig, () => child.kill(sig));

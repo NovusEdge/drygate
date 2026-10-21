@@ -1,18 +1,24 @@
-// How drygate finds jscpd and the repository to scan. drygate.js and mcp.js
-// both use it, so the gate and the MCP server always run the same jscpd.
+// How drygate finds jscpd, what it tells jscpd to skip, and the repository to
+// scan. drygate.js and mcp.js both use it, so the gate and the MCP server run
+// the same jscpd with the same options.
 
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { spawnSync } = require('child_process');
 
-// The gate's results depend on jscpd's clone fingerprints and JSON report, so
-// the copy drygate installs is pinned to the version the tests ran against.
+// The gate's results depend on jscpd's JSON report, so the copy drygate
+// installs is pinned to the version the tests ran against.
 const VERSION = '5.4.2';
 
 // npm and an npm-installed jscpd are .cmd shims on Windows, which spawn cannot
-// start without a shell.
+// start without a shell; through a shell, arguments with spaces need quotes.
 const shell = process.platform === 'win32';
+const quote = (s) => (shell && /[\s&()^|<>]/.test(s) ? `"${s}"` : s);
+
+function run(cmd, args, opts = {}) {
+  return spawnSync(quote(cmd), args.map(quote), { encoding: 'utf8', shell, windowsHide: true, ...opts });
+}
 
 // Claude Code sets CLAUDE_PLUGIN_DATA and Codex sets PLUGIN_DATA; both keep it
 // across plugin updates.
@@ -21,48 +27,76 @@ function dataDir() {
 }
 
 function onPath() {
-  const r = spawnSync('jscpd', ['--version'], { encoding: 'utf8', shell });
+  const r = run('jscpd', ['--version']);
   const m = r.status === 0 && /(\d+)\.(\d+)\.\d+/.exec(r.stdout);
-  // Older than 5.4 lacks --update-baseline and the report's isNew field.
+  // Older than 5.4 lacks consistent identifier matching.
   return Boolean(m && (+m[1] > 5 || (+m[1] === 5 && +m[2] >= 4)));
 }
 
+const installDir = () => path.join(dataDir(), `jscpd-${VERSION}`);
+const installedBin = () => path.join(installDir(), 'node_modules', '.bin', shell ? 'jscpd.cmd' : 'jscpd');
+const failedMarker = () => path.join(dataDir(), 'install-failed');
+const RETRY_AFTER = 10 * 60 * 1000;
+
 // npx re-resolves the package on every call, about 2.5 s, and Stop runs every
 // turn. A copy installed once into the data dir starts in about 0.1 s.
-function installed() {
-  const dir = path.join(dataDir(), `jscpd-${VERSION}`);
-  const bin = path.join(dir, 'node_modules', '.bin', shell ? 'jscpd.cmd' : 'jscpd');
-  if (fs.existsSync(bin)) return bin;
+//
+// Only the background snapshot process calls this: an install takes seconds
+// online and can hang for minutes behind a proxy, longer than a Stop hook may
+// run. A failure is remembered for RETRY_AFTER so each turn does not retry it.
+function install() {
   fs.mkdirSync(dataDir(), { recursive: true });
-  // The MCP server and SessionStart can both get here at once. Each installs
-  // into its own directory and renames it into place; the loser's rename fails
-  // because the target exists, and it uses the winner's copy.
-  const tmp = fs.mkdtempSync(path.join(dataDir(), '.install-'));
-  const r = spawnSync('npm', ['install', '--prefix', tmp, '--no-audit', '--no-fund', '--silent', `jscpd@${VERSION}`], {
-    encoding: 'utf8',
-    shell,
-    timeout: 110_000,
-  });
   try {
-    if (r.status !== 0) throw new Error(`npm install jscpd@${VERSION} failed: ${(r.stderr || r.error?.message || '').trim()}`);
-    fs.renameSync(tmp, dir);
+    if (Date.now() - fs.statSync(failedMarker()).mtimeMs < RETRY_AFTER) {
+      throw new Error(`npm install jscpd@${VERSION} failed recently: ${fs.readFileSync(failedMarker(), 'utf8')}`);
+    }
   } catch (e) {
-    if (!fs.existsSync(bin)) throw e;
+    if (e.code !== 'ENOENT') throw e;
+  }
+  // The MCP server and a snapshot can install at once. Each installs into its
+  // own directory and renames it into place; the loser's rename fails because
+  // the target exists, and it uses the winner's copy.
+  const tmp = fs.mkdtempSync(path.join(dataDir(), '.install-'));
+  try {
+    const r = run('npm', ['install', '--prefix', tmp, '--no-audit', '--no-fund', '--silent', `jscpd@${VERSION}`], {
+      timeout: 110_000,
+    });
+    if (r.status !== 0) {
+      const why = (r.stderr || (r.error && r.error.message) || `exit ${r.status}`).trim().split('\n').pop();
+      fs.writeFileSync(failedMarker(), why);
+      throw new Error(`npm install jscpd@${VERSION} failed: ${why}`);
+    }
+    fs.rmSync(failedMarker(), { force: true });
+    fs.renameSync(tmp, installDir());
+  } catch (e) {
+    if (!fs.existsSync(installedBin())) throw e;
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true });
   }
-  return bin;
 }
 
-function command() {
+// Returns the jscpd to run, or null when none is installed and `allowInstall`
+// is false.
+function command({ allowInstall }) {
   if (process.env.DRYGATE_JSCPD) return process.env.DRYGATE_JSCPD;
-  return onPath() ? 'jscpd' : installed();
+  if (onPath()) return 'jscpd';
+  if (!fs.existsSync(installedBin()) && allowInstall) install();
+  return fs.existsSync(installedBin()) ? installedBin() : null;
 }
 
 function gitRoot(dir) {
   if (!dir) return null;
   const r = spawnSync('git', ['rev-parse', '--show-toplevel'], { cwd: dir, encoding: 'utf8' });
   return r.status === 0 ? r.stdout.trim() : null;
+}
+
+function git(root, args) {
+  const r = spawnSync('git', ['-c', 'core.quotepath=false', ...args], {
+    cwd: root,
+    encoding: 'utf8',
+    maxBuffer: 256 << 20,
+  });
+  return (r.stdout || '').split('\0').filter(Boolean);
 }
 
 // Test copies and generated or data files repeat by design, and a gate that
@@ -78,45 +112,39 @@ const IGNORE = [
 // Worktrees, submodules and nested clones inside the repo: each is a whole
 // copy of some tree, untracked but not gitignored, so jscpd scans it. A
 // worktree the agent creates mid-session would show up as hundreds of new
-// clones and block the turn.
+// clones and block the turn. git lists an untracked directory that holds a
+// .git, at any depth, as one entry ending in a slash.
 function nested(root) {
-  const git = (...args) =>
-    spawnSync('git', args, { cwd: root, encoding: 'utf8', maxBuffer: 256 << 20 }).stdout || '';
-  const worktrees = git('worktree', 'list', '--porcelain')
-    .split('\n')
-    .filter((l) => l.startsWith('worktree '))
-    .map((l) => path.relative(root, l.slice('worktree '.length)));
-  const submodules = git('ls-files', '--stage')
-    .split('\n')
+  const untracked = git(root, ['ls-files', '-z', '--others', '--exclude-standard']).filter((p) => p.endsWith('/'));
+  const submodules = git(root, ['ls-files', '-z', '--stage'])
     .filter((l) => l.startsWith('160000 '))
-    .map((l) => l.split('\t')[1]);
-  const clones = git('ls-files', '--others', '--exclude-standard', '--directory')
-    .split('\n')
-    .filter((d) => d.endsWith('/') && fs.existsSync(path.join(root, d, '.git')));
-  return [...new Set([...worktrees, ...submodules, ...clones])]
-    .map((p) => p.replace(/\/$/, ''))
-    .filter((p) => p && !p.startsWith('..') && !path.isAbsolute(p))
-    .map((p) => `${p}/**`);
+    .map((l) => l.slice(l.indexOf('\t') + 1));
+  return [...untracked, ...submodules].map((p) => `${p.replace(/\/$/, '')}/**`);
 }
 
-// jscpd's --ignore replaces the ignore list in .jscpd.json rather than adding
-// to it, and a second --ignore replaces the first. So every pattern goes in
-// one flag: the repo's own list, the nested trees, and the caller's extras.
-function options(root, more = []) {
-  const file = path.join(root, '.jscpd.json');
-  let config = null;
-  if (fs.existsSync(file)) {
+// Writes the jscpd config for a scan of `root` to `file` and returns the CLI
+// args that use it. A config file, not --ignore: jscpd splits --ignore on
+// commas, and its --ignore replaces the ignore list in .jscpd.json rather than
+// adding to it. The repo's own .jscpd.json, when present, is the base.
+function config(root, file, more = []) {
+  const own = path.join(root, '.jscpd.json');
+  let base = null;
+  if (fs.existsSync(own)) {
     try {
-      config = JSON.parse(fs.readFileSync(file, 'utf8'));
+      base = JSON.parse(fs.readFileSync(own, 'utf8'));
     } catch {
-      config = {};
+      // jscpd reports the broken file itself when it loads it.
+      return [];
     }
   }
-  const ignore = [...(config ? config.ignore || [] : IGNORE), ...nested(root), ...more];
-  // consistent: a copy with its locals renamed is caught, but only where each
-  // name maps to one name on the other side, so `x = x + x` is not `a = b + c`.
-  const args = config ? [] : ['--ignore-identifiers=consistent'];
-  return ignore.length ? [...args, '--ignore', ignore.join(',')] : args;
+  const cfg = base
+    ? { ...base, ignore: [...(base.ignore || []), ...nested(root), ...more] }
+    : // consistent: a copy with its locals renamed is caught, but only where
+      // each name maps to one name on the other side, so `x = x + x` is not
+      // `a = b + c`.
+      { ignore: [...IGNORE, ...nested(root), ...more], ignoreIdentifiers: 'consistent' };
+  fs.writeFileSync(file, JSON.stringify(cfg));
+  return ['-c', file];
 }
 
-module.exports = { VERSION, shell, dataDir, command, gitRoot, options };
+module.exports = { VERSION, run, dataDir, command, gitRoot, git, config };

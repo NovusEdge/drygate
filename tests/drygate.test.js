@@ -16,7 +16,7 @@ const HOOK = path.join(__dirname, '..', 'hooks', 'drygate.js');
 
 if (!process.env.DRYGATE_JSCPD) {
   const shared = fs.mkdtempSync(path.join(os.tmpdir(), 'drygate-install-'));
-  const r = spawnSync('node', ['-e', "process.stdout.write(require('./hooks/jscpd').command())"], {
+  const r = spawnSync('node', ['-e', "process.stdout.write(require('./hooks/jscpd').command({ allowInstall: true }))"], {
     cwd: path.join(__dirname, '..'),
     env: { ...process.env, CLAUDE_PLUGIN_DATA: shared },
     encoding: 'utf8',
@@ -186,6 +186,72 @@ test('a second copy between files that already shared one blocks', () => {
   assert.equal(s.stop()?.decision, 'block');
 });
 
+test('renaming a file that held old duplication does not block', () => {
+  const { dir, git } = repo({ 'src/a.js': PARSER, 'src/legacy.js': PARSER.replace('parseUser', 'parseLegacy') });
+  const s = session(dir);
+  s.start();
+  git('mv', 'src/legacy.js', 'src/legacy2.js');
+  assert.equal(s.stop(), null);
+});
+
+test('a third copy of code that was already duplicated blocks', () => {
+  const { dir } = repo({ 'src/a.js': PARSER, 'src/legacy.js': PARSER.replace('parseUser', 'parseLegacy') });
+  const s = session(dir);
+  s.start();
+  write(dir, { 'src/b.js': PARSER.replace('parseUser', 'parseAdmin') });
+  const out = s.stop();
+  assert.equal(out?.decision, 'block');
+  assert.match(out.reason, /src\/b\.js/);
+});
+
+test('a duplicate let through after a block does not block later turns', () => {
+  const { dir } = repo({ 'src/a.js': PARSER });
+  const s = session(dir);
+  s.start();
+  write(dir, { 'src/b.js': PARSER.replace('parseUser', 'parseAdmin') });
+  assert.equal(s.stop().decision, 'block');
+  assert.ok(s.stop(true).systemMessage);
+  write(dir, { 'src/sum.js': OTHER });
+  assert.equal(s.stop(), null);
+});
+
+test('resume takes a new snapshot, so code pulled in between does not block', () => {
+  const { dir, git } = repo({ 'src/a.js': PARSER });
+  const s = session(dir);
+  s.start();
+  write(dir, { 'src/teammate.js': PARSER.replace('parseUser', 'parseTeam') });
+  git('add', '-A');
+  git('commit', '-qm', 'pulled');
+  s.start('resume');
+  assert.equal(s.stop(), null);
+});
+
+test('a repo cloned two levels deep inside the project is not scanned', () => {
+  const { dir } = repo({ 'src/a.js': PARSER });
+  const s = session(dir);
+  s.start();
+  write(dir, { 'scratch/r/x.js': PARSER.replace('parseUser', 'parseX') });
+  execFileSync('git', ['init', '-q'], { cwd: path.join(dir, 'scratch/r') });
+  assert.equal(s.stop(), null);
+});
+
+test('nested repos with commas or non-ASCII in their names are not scanned', () => {
+  const { dir } = repo({ 'src/a.js': PARSER });
+  const s = session(dir);
+  s.start();
+  for (const name of ['a,b', 'café']) {
+    write(dir, { [`${name}/x.js`]: PARSER.replace('parseUser', 'parseX') });
+    execFileSync('git', ['init', '-q'], { cwd: path.join(dir, name) });
+  }
+  assert.equal(s.stop(), null);
+});
+
+test('input that is not JSON makes the hook do nothing, with exit 0', () => {
+  const r = spawnSync('node', [HOOK], { input: 'x', encoding: 'utf8' });
+  assert.equal(r.status, 0);
+  assert.equal(r.stdout, '');
+});
+
 test("the user's uncommitted duplication from before the session does not block", () => {
   const { dir } = repo({ 'src/a.js': PARSER });
   write(dir, { 'src/wip.js': PARSER.replace('parseUser', 'parseWip') });
@@ -204,7 +270,7 @@ test('after one block, a second stop is allowed with a message to the user', () 
   assert.match(out.systemMessage, /src\/b\.js/);
 });
 
-test('resume keeps the baseline taken at startup', () => {
+test('a copy from an interrupted turn, which had no stop, still blocks after resume', () => {
   const { dir } = repo({ 'src/a.js': PARSER });
   const s = session(dir);
   s.start('startup');

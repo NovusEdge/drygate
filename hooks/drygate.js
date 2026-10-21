@@ -2,67 +2,95 @@
 // Blocks the end of a turn that added duplicated code. Claude Code and Codex
 // both run it with the event JSON on stdin and read a decision from stdout.
 //
-// SessionStart snapshots the clones in the working tree, per session. Stop
-// scans again and blocks on clones the session added. The snapshot is of the
-// working tree, not of a git ref: jscpd --changed rebuilds its baseline when
-// HEAD moves, so a copy the agent committed before stopping went unreported.
+// SessionStart snapshots the clones in the working tree. Stop scans again and
+// blocks on clones the session added, then moves the snapshot forward. The
+// snapshot is of the working tree, not of a git ref: jscpd --changed rebuilds
+// its baseline when HEAD moves, so a copy the agent committed before stopping
+// went unreported.
 //
-// Never exits non-zero. A broken or missing jscpd warns the user and lets the
-// turn end; a gate that fails closed would stop every session in the repo.
+// Always exits 0 and reports failures as systemMessage. Exit 2 from a Stop
+// hook blocks the turn, and a crash shows an error on every turn in every repo
+// that enables the plugin.
 
 const crypto = require('crypto');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { spawn, spawnSync } = require('child_process');
+const { spawn } = require('child_process');
 const jscpd = require('./jscpd');
 
 // A snapshot older than this with no result is from a process that died.
-const PENDING_TTL = 5 * 60 * 1000;
-// Stop waits this long for a snapshot still running; the hook timeout is 120 s.
-const PENDING_WAIT = 90 * 1000;
+const PENDING_TTL = 10 * 60 * 1000;
+// The Stop hook's timeout is 120 s: up to 60 s waiting for a running snapshot,
+// then up to 50 s for its own scan.
+const PENDING_WAIT = 60 * 1000;
+const STOP_SCAN_TIMEOUT = 50 * 1000;
 
-function scan(root, extra, ignore = []) {
+const MESSAGE =
+  'Remove each duplicate before you finish: call or import the existing code, or move the ' +
+  'shared part into one function that both places use. If the user wants a duplicate kept, ' +
+  'wrap it in jscpd:ignore-start and jscpd:ignore-end comments and say so in your reply.';
+
+function scan(root, { allowInstall, timeout, ignore = [] }) {
+  const cmd = jscpd.command({ allowInstall });
+  if (!cmd) return null;
   const out = fs.mkdtempSync(path.join(os.tmpdir(), 'drygate-'));
-  const args = ['.', '-r', 'json', '-o', out, ...jscpd.options(root, ignore), ...extra];
-  const r = spawnSync(jscpd.command(), args, { cwd: root, encoding: 'utf8', shell: jscpd.shell, timeout: 100_000 });
-  let report = null;
   try {
-    report = JSON.parse(fs.readFileSync(path.join(out, 'jscpd-report.json'), 'utf8'));
-  } catch {}
-  fs.rmSync(out, { recursive: true, force: true });
-  if (!report) {
-    const why = (r.error && r.error.message) || r.stderr.trim().split('\n').pop() || `exit ${r.status}`;
-    throw new Error(why);
+    const cfg = jscpd.config(root, path.join(out, 'config.json'), ignore);
+    const r = jscpd.run(cmd, ['.', '-r', 'json', '-o', out, ...cfg], { cwd: root, timeout });
+    try {
+      return JSON.parse(fs.readFileSync(path.join(out, 'jscpd-report.json'), 'utf8')).duplicates;
+    } catch {
+      if (r.error && r.error.code === 'ETIMEDOUT') throw new Error(`jscpd took longer than ${timeout / 1000} s`);
+      throw new Error((r.error && r.error.message) || (r.stderr || '').trim().split('\n').pop() || `exit ${r.status}`);
+    }
+  } finally {
+    fs.rmSync(out, { recursive: true, force: true });
   }
-  return report.duplicates;
 }
 
-function byPair(clones) {
-  const pairs = new Map();
+const pairOf = (c) => [c.firstFile.name, c.secondFile.name].sort().join('\0');
+// What a clone repeats, wherever it sits. Renaming a file or shifting lines
+// keeps it; editing the code changes it.
+const contentOf = (c) => crypto.createHash('sha1').update(c.fragment.replace(/\s+/g, ' ').trim()).digest('hex');
+
+function tally(clones) {
+  const pairs = {};
+  const contents = {};
   for (const c of clones) {
-    const key = [c.firstFile.name, c.secondFile.name].sort().join('\0');
-    pairs.set(key, [...(pairs.get(key) || []), c]);
+    pairs[pairOf(c)] = (pairs[pairOf(c)] || 0) + 1;
+    contents[contentOf(c)] = (contents[contentOf(c)] || 0) + 1;
   }
-  return pairs;
+  return { pairs, contents };
 }
 
-// Files git reports as changed or untracked, with their mtime and size.
+// A clone counts as added when both its file pair and its content are more
+// common than in the snapshot. Pair alone fails on a rename: the moved file
+// forms a new pair with the same old clone. Content alone fails on an edit
+// inside an old clone, which changes its content but adds nothing. Not caught:
+// removing one clone and adding a different one between the same two files.
+function added(before, clones) {
+  const now = tally(clones);
+  return clones.filter(
+    (c) =>
+      now.pairs[pairOf(c)] > (before.pairs[pairOf(c)] || 0) &&
+      now.contents[contentOf(c)] > (before.contents[contentOf(c)] || 0)
+  );
+}
+
+// Files git reports as changed or untracked. With -z, a rename or copy entry
+// is followed by a second entry holding its old path.
 function changes(root) {
-  const r = spawnSync('git', ['status', '--porcelain=v1', '-z', '-uall'], {
-    cwd: root,
-    encoding: 'utf8',
-    maxBuffer: 256 << 20,
-  });
+  const entries = jscpd.git(root, ['status', '--porcelain=v1', '-z', '-uall']);
   const files = [];
-  for (const entry of (r.stdout || '').split('\0')) {
-    const name = entry.slice(3);
-    if (!name) continue;
+  for (let i = 0; i < entries.length; i++) {
+    const name = entries[i].slice(3);
+    if ('RC'.includes(entries[i][0])) i++;
     try {
       const st = fs.statSync(path.join(root, name));
-      files.push({ name, mtime: st.mtimeMs, size: st.size });
+      files.push(`${name}\0${st.mtimeMs}\0${st.size}`);
     } catch {
-      files.push({ name, mtime: 0, size: -1 });
+      files.push(`${name}\0gone`);
     }
   }
   return files;
@@ -70,9 +98,8 @@ function changes(root) {
 
 // Equal fingerprints mean the tree jscpd would scan has not changed.
 function fingerprint(root) {
-  const head = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8' }).stdout || '';
-  const h = crypto.createHash('sha1').update(head);
-  for (const f of changes(root)) h.update(`${f.name}\0${f.mtime}\0${f.size}\0`);
+  const h = crypto.createHash('sha1').update(jscpd.git(root, ['rev-parse', 'HEAD']).join(''));
+  for (const f of changes(root)) h.update(`${f}\0`);
   return h.digest('hex');
 }
 
@@ -80,18 +107,20 @@ function fingerprint(root) {
 // status: a file the agent wrote and committed while the snapshot ran is no
 // longer in git status.
 function touchedSince(root, since) {
-  const r = spawnSync('git', ['ls-files', '-z', '-co', '--exclude-standard'], {
-    cwd: root,
-    encoding: 'utf8',
-    maxBuffer: 256 << 20,
-  });
-  return (r.stdout || '').split('\0').filter((name) => {
+  return jscpd.git(root, ['ls-files', '-z', '-co', '--exclude-standard']).filter((name) => {
     try {
-      return name && fs.statSync(path.join(root, name)).mtimeMs > since;
+      return fs.statSync(path.join(root, name)).mtimeMs > since;
     } catch {
       return false;
     }
   });
+}
+
+function save(file, data) {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  // Stop polls for this file, so it must appear only once complete.
+  fs.writeFileSync(`${file}.tmp`, JSON.stringify(data));
+  fs.renameSync(`${file}.tmp`, file);
 }
 
 // `since` is when SessionStart ran. A file modified after it is the session's
@@ -99,69 +128,53 @@ function touchedSince(root, since) {
 // The cost: a clone that existed before, in a file the agent edits before the
 // snapshot finishes, also counts as added. The snapshot takes up to a few
 // seconds; an interactive session's first edit comes after the user's prompt.
-function snapshot(root, state, since) {
-  fs.mkdirSync(state.dir, { recursive: true });
-  const touched = since ? touchedSince(root, since) : [];
-  const clones = scan(root, ['--baseline', state.baseline, '--update-baseline'], touched);
-  const counts = Object.fromEntries([...byPair(clones)].map(([k, v]) => [k, v.length]));
-  // The rename makes the pairs file appear only once complete; Stop polls for it.
-  fs.writeFileSync(`${state.pairs}.tmp`, JSON.stringify(counts));
-  fs.renameSync(`${state.pairs}.tmp`, state.pairs);
-}
-
-// jscpd takes seconds on a large repo, and the first run in a machine installs
-// it. SessionStart hands the snapshot to a detached process so the session's
-// first prompt does not wait for either.
-function startSnapshot(root, state) {
-  fs.mkdirSync(state.dir, { recursive: true });
-  const since = Date.now();
-  fs.writeFileSync(state.pending, String(since));
-  spawn(process.execPath, [__filename], {
-    detached: true,
-    stdio: 'ignore',
-    env: { ...process.env, DRYGATE_SNAPSHOT: JSON.stringify({ root, state, since }) },
-  }).unref();
-}
-
+//
+// `checked` is set on resume: the last time a Stop checked the tree. Claude
+// Code runs no Stop for an interrupted turn, so uncommitted files changed since
+// then are unchecked work and stay out too. Committed changes since then, such
+// as a pull, are other people's and go in.
 function runSnapshotJob() {
-  const { root, state, since } = JSON.parse(process.env.DRYGATE_SNAPSHOT);
+  const { root, state, since, checked } = JSON.parse(process.env.DRYGATE_SNAPSHOT);
   try {
-    snapshot(root, state, since);
+    const ignore = touchedSince(root, since);
+    if (checked) {
+      const dirty = new Set(changes(root).map((f) => f.split('\0')[0]));
+      ignore.push(...touchedSince(root, checked).filter((f) => dirty.has(f)));
+    }
+    const clones = scan(root, { allowInstall: true, timeout: 300_000, ignore });
+    if (!clones) throw new Error('jscpd is not installed and could not be installed');
+    save(state.snapshot, tally(clones));
   } catch (e) {
     fs.writeFileSync(state.error, e.message);
   }
   fs.rmSync(state.pending, { force: true });
 }
 
+// jscpd takes seconds on a large repo, and the first run on a machine installs
+// it. The snapshot runs in a detached process so neither holds up the session.
+function startSnapshot(root, state, checked = null) {
+  fs.mkdirSync(state.dir, { recursive: true });
+  const since = Date.now();
+  fs.writeFileSync(state.pending, String(since));
+  spawn(process.execPath, [__filename], {
+    detached: true,
+    stdio: 'ignore',
+    windowsHide: true,
+    env: { ...process.env, DRYGATE_SNAPSHOT: JSON.stringify({ root, state, since, checked }) },
+  }).unref();
+}
+
+function pendingSince(state) {
+  try {
+    const since = Number(fs.readFileSync(state.pending, 'utf8'));
+    return Date.now() - since < PENDING_TTL ? since : null;
+  } catch {
+    return null;
+  }
+}
+
 function sleep(ms) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
-}
-
-function awaitSnapshot(state) {
-  let since;
-  try {
-    since = Number(fs.readFileSync(state.pending, 'utf8'));
-  } catch {
-    return;
-  }
-  if (Date.now() - since > PENDING_TTL) return;
-  const deadline = Date.now() + PENDING_WAIT;
-  while (fs.existsSync(state.pending) && !fs.existsSync(state.pairs) && Date.now() < deadline) sleep(100);
-}
-
-// A clone counts as added when its file pair has more clones than at session
-// start. jscpd's own isNew is not enough: editing one literal inside a clone
-// that already existed changes its fingerprint, and old debt would then block
-// unrelated work.
-function added(root, state) {
-  const before = JSON.parse(fs.readFileSync(state.pairs, 'utf8'));
-  const found = [];
-  for (const [key, clones] of byPair(scan(root, ['--baseline', state.baseline]))) {
-    if (clones.length <= (before[key] || 0)) continue;
-    const fresh = clones.filter((c) => c.isNew);
-    found.push(...(fresh.length ? fresh : clones));
-  }
-  return found;
 }
 
 function where(f) {
@@ -184,40 +197,45 @@ function describe(root, c) {
 }
 
 function stop(input, root, state) {
-  if (!fs.existsSync(state.pairs)) awaitSnapshot(state);
+  if (pendingSince(state)) {
+    const deadline = Date.now() + PENDING_WAIT;
+    while (pendingSince(state) && Date.now() < deadline) sleep(100);
+  }
   if (fs.existsSync(state.error)) {
     const why = fs.readFileSync(state.error, 'utf8');
     fs.rmSync(state.error, { force: true });
     throw new Error(why);
   }
-  if (!fs.existsSync(state.pairs)) {
-    // No snapshot for this session: the data dir was cleared, or the plugin was
-    // installed mid-session. Take one now; the next turn is checked against it.
-    snapshot(root, state);
+  if (!fs.existsSync(state.snapshot)) {
+    if (pendingSince(state)) throw new Error('the session snapshot is still running');
+    // No snapshot: the data dir was cleared, or the plugin was installed
+    // mid-session. This turn's changes would be in a snapshot taken now, so
+    // take it in the background and check from the next turn on.
+    startSnapshot(root, state);
     return null;
   }
-  // Checked only after a pass: a stop right after a block must scan again so
-  // the second stop can report what is left.
   const fp = fingerprint(root);
   if (fs.existsSync(state.passed) && fs.readFileSync(state.passed, 'utf8') === fp) return null;
-  const clones = added(root, state);
-  if (!clones.length) {
+  const clones = scan(root, { allowInstall: false, timeout: STOP_SCAN_TIMEOUT });
+  if (!clones) {
+    startSnapshot(root, state);
+    throw new Error('jscpd is being installed in the background');
+  }
+  const before = JSON.parse(fs.readFileSync(state.snapshot, 'utf8'));
+  const found = added(before, clones);
+  // The snapshot moves forward after a pass, and after a second stop lets
+  // remaining duplicates through: those were reported once, and blocking on
+  // them again every turn would make the user turn the gate off.
+  if (!found.length || input.stop_hook_active) {
+    save(state.snapshot, tally(clones));
     fs.writeFileSync(state.passed, fp);
-    return null;
   }
-  fs.rmSync(state.passed, { force: true });
-  const list = clones.map((c) => describe(root, c)).join('\n');
+  if (!found.length) return null;
+  const list = found.map((c) => describe(root, c)).join('\n');
   if (input.stop_hook_active) {
-    return { systemMessage: `drygate: this session's changes still duplicate code:\n${list}` };
+    return { systemMessage: `drygate: duplicated code kept this turn:\n${list}` };
   }
-  return {
-    decision: 'block',
-    reason:
-      `drygate: this session added duplicated code.\n${list}\n\n` +
-      'Remove each duplicate before you finish: call or import the existing code, or move the ' +
-      'shared part into one function that both places use. If the user wants a duplicate kept, ' +
-      'wrap it in jscpd:ignore-start and jscpd:ignore-end comments and say so in your reply.',
-  };
+  return { decision: 'block', reason: `drygate: this session added duplicated code.\n${list}\n\n${MESSAGE}` };
 }
 
 function stateFor(input, root) {
@@ -227,44 +245,66 @@ function stateFor(input, root) {
   const base = path.join(dir, `${String(input.session_id || 'none').replace(/[^\w-]/g, '_')}-${repo}`);
   return {
     dir,
-    baseline: `${base}.baseline.json`,
-    pairs: `${base}.pairs.json`,
+    snapshot: `${base}.snapshot.json`,
     pending: `${base}.pending`,
     error: `${base}.error`,
     passed: `${base}.passed`,
   };
 }
 
-function prune(dir) {
-  const week = 7 * 24 * 3600 * 1000;
-  for (const f of fs.existsSync(dir) ? fs.readdirSync(dir) : []) {
-    const p = path.join(dir, f);
-    if (Date.now() - fs.statSync(p).mtimeMs > week) fs.rmSync(p, { force: true });
+function prune() {
+  const old = (p, ms) => {
+    try {
+      return Date.now() - fs.statSync(p).mtimeMs > ms;
+    } catch {
+      return false;
+    }
+  };
+  const data = jscpd.dataDir();
+  const sessions = path.join(data, 'sessions');
+  for (const f of fs.existsSync(sessions) ? fs.readdirSync(sessions) : []) {
+    if (old(path.join(sessions, f), 7 * 24 * 3600 * 1000)) fs.rmSync(path.join(sessions, f), { force: true });
+  }
+  // Left by an npm install that was killed mid-way.
+  for (const f of fs.existsSync(data) ? fs.readdirSync(data) : []) {
+    const p = path.join(data, f);
+    if (f.startsWith('.install-') && old(p, 3600 * 1000)) fs.rmSync(p, { recursive: true, force: true });
   }
 }
 
 function main() {
   if (process.env.DRYGATE_DISABLE === '1') return null;
-  const input = JSON.parse(fs.readFileSync(0, 'utf8') || '{}');
+  let input;
+  try {
+    input = JSON.parse(fs.readFileSync(0, 'utf8'));
+  } catch {
+    return null;
+  }
   const root = jscpd.gitRoot(process.env.CLAUDE_PROJECT_DIR || input.cwd);
   if (!root) return null;
   const state = stateFor(input, root);
-  try {
-    if (input.hook_event_name === 'SessionStart') {
-      prune(state.dir);
-      if (!fs.existsSync(state.pairs) && !fs.existsSync(state.pending)) startSnapshot(root, state);
-      return null;
+  if (input.hook_event_name === 'SessionStart') {
+    prune();
+    // On resume the session may be days old and the tree has moved on: other
+    // people's commits are not the session's work and must not block it.
+    const resumed = input.source === 'resume' && fs.existsSync(state.snapshot);
+    if ((resumed || !fs.existsSync(state.snapshot)) && !pendingSince(state)) {
+      startSnapshot(root, state, resumed ? fs.statSync(state.snapshot).mtimeMs : null);
     }
-    if (input.hook_event_name === 'Stop') return stop(input, root, state);
-  } catch (e) {
-    return { systemMessage: `drygate: jscpd did not run, so this turn was not checked: ${e.message}` };
+    return null;
   }
+  if (input.hook_event_name === 'Stop') return stop(input, root, state);
   return null;
 }
 
 if (process.env.DRYGATE_SNAPSHOT) {
   runSnapshotJob();
 } else {
-  const out = main();
+  let out = null;
+  try {
+    out = main();
+  } catch (e) {
+    out = { systemMessage: `drygate: this turn was not checked for duplicated code: ${e.message}` };
+  }
   if (out) process.stdout.write(JSON.stringify(out));
 }

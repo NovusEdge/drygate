@@ -2,7 +2,7 @@
   "mcpServers": {
     "jscpd": {
       "command": "node",
-      "args": ["${CLAUDE_PLUGIN_ROOT}/hooks/mcp.js", "${CLAUDE_PROJECT_DIR}"]
+      "args": ["${CLAUDE_PLUGIN_ROOT}/hooks/mcp.js", "${CLAUDE_PROJECT_DIR:-}"]
     }
   }
 }

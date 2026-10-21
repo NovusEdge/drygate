@@ -45,36 +45,44 @@ On a Nimble Fox repo, install it from the team marketplace instead: `drygate@nim
 
 Nothing to install by hand. drygate uses a jscpd 5.4 or later from `PATH` if there is one.
 Otherwise the first session installs jscpd 5.4.2 with npm into the plugin's data directory,
-once per machine, in the background. To use a specific binary, set `DRYGATE_JSCPD` to its
-path.
+once per machine, in the background; until that finishes, stops are not checked and say so.
+A failed install, for example offline or behind a proxy npm cannot reach, is retried after
+10 minutes. To use a specific binary, set `DRYGATE_JSCPD` to its path.
 
 ## How the gate decides
 
-At session start, drygate scans the working tree in a background process and records
-every clone, grouped by the pair of files it joins. At each stop it scans again and blocks
-when a pair of files has more clones than it had at session start.
+At session start, drygate scans the working tree in a background process and counts the
+clones by the pair of files they join and by the code they repeat. At each stop it scans
+again and blocks on a clone when both its file pair and its code are more common than in
+the snapshot. After a stop that passes, the snapshot moves forward to the current tree.
 
-- Duplication that was already there, committed or not, never blocks. Editing an old clone
-  does not block either.
+- Duplication that was already there, committed or not, never blocks. Editing an old clone,
+  renaming its file or moving it does not block either.
+- A third copy of code that was already duplicated blocks.
 - A copy the agent commits before it stops still blocks. drygate compares against the
   snapshot, not against `HEAD`.
-- A copy with its local names changed still counts (`--ignore-identifiers=consistent`).
-- After one block, the next stop is let through, and the user sees what is left.
-- A stop with no file changed since the last clean check skips the scan.
+- A copy with its local names changed still counts (renamed-identifier matching).
+- After one block, the next stop is let through, the user sees what is left, and those
+  copies are accepted from then on.
+- On resume, drygate takes a new snapshot, so commits pulled in between do not block.
+  Uncommitted changes since the last check stay out of it: a turn the user interrupted had
+  no stop, so they are still checked.
+- A stop with no file changed since the last check skips the scan.
 - If jscpd cannot run, drygate warns the user and lets the turn end.
 
 The scan leaves out test, fixture, vendored, generated and minified files, and data and doc
 formats (Markdown, JSON, YAML). It always leaves out git worktrees, submodules and nested
 clones inside the repository. The minimum clone size is jscpd's default, 50 tokens.
 
-On a 193,000-line C# repository, the first stop of a session takes about 2.5 seconds and a
-stop with nothing changed about 0.15 seconds. Session start returns in about 0.1 seconds.
+On a 193,000-line C# repository, a stop that has to scan takes about 2.5 seconds and a stop
+with nothing changed about 0.15 seconds. Session start returns in about 0.1 seconds; its
+snapshot finishes in the background a few seconds later.
 
 ## Configuration
 
 A `.jscpd.json` at the repository root replaces drygate's defaults: the ignore list,
-renamed-copy detection and any other jscpd option. drygate still adds the worktree and
-submodule paths to its `ignore` list. See jscpd's
+renamed-copy detection and any other jscpd option. drygate still adds worktrees,
+submodules and nested clones to its `ignore` list. See jscpd's
 [options](https://github.com/kucherenko/jscpd#options).
 
 To keep a deliberate duplicate, wrap it in comments the gate skips:
@@ -92,6 +100,8 @@ To keep a deliberate duplicate, wrap it in comments the gate skips:
 - The gate finds copies of text: exact copies, renamed copies and near-copies. It does not
   find two functions that do the same thing written differently. The sweep covers part of
   that: code the standard library or a dependency already provides.
+- Removing one clone and adding a different one between the same two files, in the same
+  turn, is not caught: the counts do not change.
 - A clone that existed before the session, in a file the agent edits before the start
   snapshot finishes, counts as new and blocks once. The snapshot takes a few seconds at most,
   and in an interactive session the first edit comes after the user's first prompt.
