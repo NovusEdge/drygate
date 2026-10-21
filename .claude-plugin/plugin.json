@@ -1,0 +1,19 @@
+{
+  "name": "drygate",
+  "displayName": "drygate",
+  "version": "0.1.0",
+  "description": "Blocks the end of a turn that added duplicated code, using jscpd, and gives the agent jscpd's MCP tools to check for existing code first.",
+  "author": {
+    "name": "NovusEdge"
+  },
+  "license": "MIT",
+  "homepage": "https://github.com/NovusEdge/drygate",
+  "keywords": [
+    "dry",
+    "duplication",
+    "copy-paste",
+    "code-quality",
+    "jscpd",
+    "hooks"
+  ]
+}

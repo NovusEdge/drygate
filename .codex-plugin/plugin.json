@@ -1,0 +1,29 @@
+{
+  "name": "drygate",
+  "version": "0.1.0",
+  "description": "Blocks the end of a turn that added duplicated code, using jscpd.",
+  "author": {
+    "name": "NovusEdge",
+    "url": "https://github.com/NovusEdge"
+  },
+  "homepage": "https://github.com/NovusEdge/drygate",
+  "repository": "https://github.com/NovusEdge/drygate",
+  "license": "MIT",
+  "keywords": [
+    "dry",
+    "duplication",
+    "copy-paste",
+    "code-quality",
+    "jscpd",
+    "hooks"
+  ],
+  "skills": "./skills/",
+  "hooks": "./hooks/hooks.json",
+  "interface": {
+    "displayName": "drygate",
+    "shortDescription": "Blocks agent turns that add duplicated code.",
+    "developerName": "NovusEdge",
+    "category": "Coding",
+    "websiteURL": "https://github.com/NovusEdge/drygate"
+  }
+}

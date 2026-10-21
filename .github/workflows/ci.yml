@@ -1,0 +1,30 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node-version: ['20', '22', '24']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+      - run: node --test tests/drygate.test.js
+
+      # Codex and Claude Code read separate manifests; a release that bumps one
+      # leaves the other tool on the old version.
+      - name: Codex and Claude manifests agree
+        run: |
+          node -e '
+            const c = require("./.claude-plugin/plugin.json");
+            const x = require("./.codex-plugin/plugin.json");
+            if (c.name !== x.name || c.version !== x.version) {
+              console.error(`claude ${c.name}@${c.version}, codex ${x.name}@${x.version}`);
+              process.exit(1);
+            }'
