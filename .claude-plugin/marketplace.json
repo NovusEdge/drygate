@@ -4,12 +4,12 @@
     "name": "NovusEdge",
     "url": "https://github.com/NovusEdge"
   },
-  "description": "Blocks agent turns that add duplicated code.",
+  "description": "Warns when agent turns add duplicated code.",
   "plugins": [
     {
       "name": "drygate",
       "source": "./",
-      "description": "Blocks the end of a turn that added duplicated code, using jscpd, and gives the agent jscpd's MCP tools to check for existing code first.",
+      "description": "Warns at the end of a turn that added duplicated code, using jscpd, and gives the agent jscpd's MCP tools to check for existing code first.",
       "keywords": [
         "dry",
         "duplication",

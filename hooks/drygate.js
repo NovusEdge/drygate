@@ -1,16 +1,21 @@
 #!/usr/bin/env node
-// Blocks the end of a turn that added duplicated code. Claude Code and Codex
+// Warns at the end of a turn that added duplicated code. Claude Code and Codex
 // both run it with the event JSON on stdin and read a decision from stdout.
 //
+// It warns instead of blocking because every Stop hook shares one
+// stop_hook_active flag: a block from drygate used up the one refusal another
+// plugin's Stop hook relies on, such as a harness that refuses to end a turn
+// before its agent has reported.
+//
 // SessionStart snapshots the clones in the working tree. Stop scans again and
-// blocks on clones the session added, then moves the snapshot forward. The
+// warns on clones the session added, then moves the snapshot forward. The
 // snapshot is of the working tree, not of a git ref: jscpd --changed rebuilds
 // its baseline when HEAD moves, so a copy the agent committed before stopping
 // went unreported.
 //
-// Always exits 0 and reports failures as systemMessage. Exit 2 from a Stop
-// hook blocks the turn, and a crash shows an error on every turn in every repo
-// that enables the plugin.
+// Always exits 0 and reports through systemMessage. Exit 2 from a Stop hook
+// blocks the turn, and a crash shows an error on every turn in every repo that
+// enables the plugin.
 
 const crypto = require('crypto');
 const fs = require('fs');
@@ -25,11 +30,6 @@ const PENDING_TTL = 10 * 60 * 1000;
 // then up to 50 s for its own scan.
 const PENDING_WAIT = 60 * 1000;
 const STOP_SCAN_TIMEOUT = 50 * 1000;
-
-const MESSAGE =
-  'Remove each duplicate before you finish: call or import the existing code, or move the ' +
-  'shared part into one function that both places use. If the user wants a duplicate kept, ' +
-  'wrap it in jscpd:ignore-start and jscpd:ignore-end comments and say so in your reply.';
 
 function scan(root, { allowInstall, timeout, ignore = [] }) {
   const cmd = jscpd.command({ allowInstall });
@@ -223,19 +223,12 @@ function stop(input, root, state) {
   }
   const before = JSON.parse(fs.readFileSync(state.snapshot, 'utf8'));
   const found = added(before, clones);
-  // The snapshot moves forward after a pass, and after a second stop lets
-  // remaining duplicates through: those were reported once, and blocking on
-  // them again every turn would make the user turn the gate off.
-  if (!found.length || input.stop_hook_active) {
-    save(state.snapshot, tally(clones));
-    fs.writeFileSync(state.passed, fp);
-  }
+  // The snapshot always moves forward, so each duplicate is reported once.
+  save(state.snapshot, tally(clones));
+  fs.writeFileSync(state.passed, fp);
   if (!found.length) return null;
   const list = found.map((c) => describe(root, c)).join('\n');
-  if (input.stop_hook_active) {
-    return { systemMessage: `drygate: duplicated code kept this turn:\n${list}` };
-  }
-  return { decision: 'block', reason: `drygate: this session added duplicated code.\n${list}\n\n${MESSAGE}` };
+  return { systemMessage: `drygate: this session added duplicated code:\n${list}` };
 }
 
 function stateFor(input, root) {

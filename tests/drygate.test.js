@@ -110,6 +110,7 @@ function session(dir, opts = {}) {
 }
 
 const BROKEN = { DRYGATE_JSCPD: path.join(os.tmpdir(), 'no-such-jscpd') };
+const WARN = /drygate: this session added duplicated code/;
 
 test('a turn that adds no duplication stops normally', () => {
   const { dir } = repo({ 'src/a.js': PARSER });
@@ -119,14 +120,15 @@ test('a turn that adds no duplication stops normally', () => {
   assert.equal(s.stop(), null);
 });
 
-test('a new copy of existing code blocks the stop and names both files', () => {
+test('a new copy of existing code warns without blocking and names both files', () => {
   const { dir } = repo({ 'src/a.js': PARSER });
   const s = session(dir);
   s.start();
   write(dir, { 'src/b.js': PARSER.replace('parseUser', 'parseAdmin') });
   const out = s.stop();
-  assert.equal(out.decision, 'block');
-  assert.match(out.reason, /src\/b\.js:1-13 repeats src\/a\.js:1-13/);
+  assert.equal(out.decision, undefined);
+  assert.match(out.systemMessage, WARN);
+  assert.match(out.systemMessage, /src\/b\.js:1-13 repeats src\/a\.js:1-13/);
 });
 
 test('the file written later is named as the copy, whichever side jscpd lists first', () => {
@@ -134,39 +136,39 @@ test('the file written later is named as the copy, whichever side jscpd lists fi
   const s = session(dir);
   s.start();
   write(dir, { 'src/a.js': PARSER.replace('parseUser', 'parseAdmin') });
-  assert.match(s.stop().reason, /src\/a\.js:1-13 repeats src\/z\.js:1-13/);
+  assert.match(s.stop().systemMessage, /src\/a\.js:1-13 repeats src\/z\.js:1-13/);
 });
 
-test('a copy with renamed locals still blocks', () => {
+test('a copy with renamed locals still warns', () => {
   const { dir } = repo({ 'src/a.js': PARSER });
   const s = session(dir);
   s.start();
   const renamed = PARSER.replace(/parts/g, 'fields').replace(/email/g, 'mail').replace('parseUser', 'parseGuest');
   write(dir, { 'src/c.js': renamed });
-  assert.equal(s.stop()?.decision, 'block');
+  assert.match(s.stop()?.systemMessage ?? '', WARN);
 });
 
-test('a copy committed before the stop still blocks', () => {
+test('a copy committed before the stop still warns', () => {
   const { dir, git } = repo({ 'src/a.js': PARSER });
   const s = session(dir);
   s.start();
   write(dir, { 'src/b.js': PARSER.replace('parseUser', 'parseAdmin') });
   git('add', '-A');
   git('commit', '-qm', 'copy');
-  assert.equal(s.stop()?.decision, 'block');
+  assert.match(s.stop()?.systemMessage ?? '', WARN);
 });
 
-test('a copy committed while the background snapshot runs still blocks', () => {
+test('a copy committed while the background snapshot runs still warns', () => {
   const { dir, git } = repo({ 'src/a.js': PARSER });
   const s = session(dir);
   s.start('startup', { wait: false });
   write(dir, { 'src/b.js': PARSER.replace('parseUser', 'parseAdmin') });
   git('add', '-A');
   git('commit', '-qm', 'copy');
-  assert.equal(s.stop()?.decision, 'block');
+  assert.match(s.stop()?.systemMessage ?? '', WARN);
 });
 
-test('editing a clone that existed at session start does not block', () => {
+test('editing a clone that existed at session start does not warn', () => {
   const { dir } = repo({ 'src/a.js': PARSER, 'src/legacy.js': PARSER.replace('parseUser', 'parseLegacy') });
   const s = session(dir);
   s.start();
@@ -175,7 +177,7 @@ test('editing a clone that existed at session start does not block', () => {
   assert.equal(s.stop(), null);
 });
 
-test('a second copy between files that already shared one blocks', () => {
+test('a second copy between files that already shared one warns', () => {
   const { dir } = repo({ 'src/a.js': PARSER + '\n' + OTHER, 'src/legacy.js': PARSER.replace('parseUser', 'parseLegacy') });
   const s = session(dir);
   s.start();
@@ -183,10 +185,10 @@ test('a second copy between files that already shared one blocks', () => {
   write(dir, { 'src/a.js': PARSER + '\n' + big });
   const legacy = fs.readFileSync(path.join(dir, 'src/legacy.js'), 'utf8');
   write(dir, { 'src/legacy.js': legacy + '\n' + big.replace('sum', 'total') });
-  assert.equal(s.stop()?.decision, 'block');
+  assert.match(s.stop()?.systemMessage ?? '', WARN);
 });
 
-test('renaming a file that held old duplication does not block', () => {
+test('renaming a file that held old duplication does not warn', () => {
   const { dir, git } = repo({ 'src/a.js': PARSER, 'src/legacy.js': PARSER.replace('parseUser', 'parseLegacy') });
   const s = session(dir);
   s.start();
@@ -194,28 +196,28 @@ test('renaming a file that held old duplication does not block', () => {
   assert.equal(s.stop(), null);
 });
 
-test('a third copy of code that was already duplicated blocks', () => {
+test('a third copy of code that was already duplicated warns', () => {
   const { dir } = repo({ 'src/a.js': PARSER, 'src/legacy.js': PARSER.replace('parseUser', 'parseLegacy') });
   const s = session(dir);
   s.start();
   write(dir, { 'src/b.js': PARSER.replace('parseUser', 'parseAdmin') });
   const out = s.stop();
-  assert.equal(out?.decision, 'block');
-  assert.match(out.reason, /src\/b\.js/);
+  assert.match(out?.systemMessage ?? '', WARN);
+  assert.match(out.systemMessage, /src\/b\.js/);
 });
 
-test('a duplicate let through after a block does not block later turns', () => {
+test('a duplicate is reported once, not on later turns', () => {
   const { dir } = repo({ 'src/a.js': PARSER });
   const s = session(dir);
   s.start();
   write(dir, { 'src/b.js': PARSER.replace('parseUser', 'parseAdmin') });
-  assert.equal(s.stop().decision, 'block');
-  assert.ok(s.stop(true).systemMessage);
+  assert.match(s.stop().systemMessage, WARN);
+  assert.equal(s.stop(), null);
   write(dir, { 'src/sum.js': OTHER });
   assert.equal(s.stop(), null);
 });
 
-test('resume takes a new snapshot, so code pulled in between does not block', () => {
+test('resume takes a new snapshot, so code pulled in between does not warn', () => {
   const { dir, git } = repo({ 'src/a.js': PARSER });
   const s = session(dir);
   s.start();
@@ -252,7 +254,7 @@ test('input that is not JSON makes the hook do nothing, with exit 0', () => {
   assert.equal(r.stdout, '');
 });
 
-test("the user's uncommitted duplication from before the session does not block", () => {
+test("the user's uncommitted duplication from before the session does not warn", () => {
   const { dir } = repo({ 'src/a.js': PARSER });
   write(dir, { 'src/wip.js': PARSER.replace('parseUser', 'parseWip') });
   const s = session(dir);
@@ -260,7 +262,7 @@ test("the user's uncommitted duplication from before the session does not block"
   assert.equal(s.stop(), null);
 });
 
-test('after one block, a second stop is allowed with a message to the user', () => {
+test('a stop continued by another Stop hook still warns and never blocks', () => {
   const { dir } = repo({ 'src/a.js': PARSER });
   const s = session(dir);
   s.start();
@@ -270,13 +272,13 @@ test('after one block, a second stop is allowed with a message to the user', () 
   assert.match(out.systemMessage, /src\/b\.js/);
 });
 
-test('a copy from an interrupted turn, which had no stop, still blocks after resume', () => {
+test('a copy from an interrupted turn, which had no stop, still warns after resume', () => {
   const { dir } = repo({ 'src/a.js': PARSER });
   const s = session(dir);
   s.start('startup');
   write(dir, { 'src/b.js': PARSER.replace('parseUser', 'parseAdmin') });
   s.start('resume');
-  assert.equal(s.stop()?.decision, 'block');
+  assert.match(s.stop()?.systemMessage ?? '', WARN);
 });
 
 test('a stop with no baseline takes one and lets the turn end', () => {
@@ -285,7 +287,7 @@ test('a stop with no baseline takes one and lets the turn end', () => {
   const s = session(dir);
   assert.equal(s.stop(), null);
   write(dir, { 'src/c.js': PARSER.replace('parseUser', 'parseGuest') });
-  assert.equal(s.stop()?.decision, 'block');
+  assert.match(s.stop()?.systemMessage ?? '', WARN);
 });
 
 test("the repo's own .jscpd.json replaces drygate's defaults", () => {
@@ -296,7 +298,7 @@ test("the repo's own .jscpd.json replaces drygate's defaults", () => {
   assert.equal(s.stop(), null);
 });
 
-test('a git worktree created inside the repo during the session does not block', () => {
+test('a git worktree created inside the repo during the session does not warn', () => {
   const { dir, git } = repo({ 'src/a.js': PARSER });
   const s = session(dir);
   s.start();
@@ -351,21 +353,12 @@ test('a stop with no file changed since the last clean check does not scan', () 
   assert.match(s.stop(false, BROKEN).systemMessage, /drygate/);
 });
 
-test('a stop right after a block scans again even with no change', () => {
-  const { dir } = repo({ 'src/a.js': PARSER });
-  const s = session(dir);
-  s.start();
-  write(dir, { 'src/b.js': PARSER.replace('parseUser', 'parseAdmin') });
-  assert.equal(s.stop().decision, 'block');
-  assert.match(s.stop(true).systemMessage, /src\/b\.js/);
-});
-
 test('a file written while the background snapshot runs still counts as new', () => {
   const { dir } = repo({ 'src/a.js': PARSER });
   const s = session(dir);
   s.start('startup', { wait: false });
   write(dir, { 'src/b.js': PARSER.replace('parseUser', 'parseAdmin') });
-  assert.equal(s.stop()?.decision, 'block');
+  assert.match(s.stop()?.systemMessage ?? '', WARN);
 });
 
 test('DRYGATE_DISABLE=1 turns the hook off', () => {

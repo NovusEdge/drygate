@@ -2,9 +2,11 @@
 
 drygate keeps coding agents from adding duplicated code. It has three parts:
 
-- **A stop gate.** When the agent finishes a turn, drygate runs [jscpd](https://github.com/kucherenko/jscpd)
-  over the repository. If the session added a block that repeats code elsewhere, the turn
-  does not end: the agent gets the list of copies and has to remove them first.
+- **A stop check.** When the agent finishes a turn, drygate runs [jscpd](https://github.com/kucherenko/jscpd)
+  over the repository. If the session added a block that repeats code elsewhere, drygate
+  shows the user the list of copies. It warns and never blocks the turn: Claude Code shares
+  one `stop_hook_active` flag between all Stop hooks, so a block from drygate would use up
+  the one refusal another Stop hook relies on.
 - **A sweep**, `/drygate:sweep`, for code jscpd cannot see: functions that reimplement the
   standard library or an installed dependency, and wrappers that add nothing. Haiku scouts
   read the code in parallel batches and Sonnet verifies every candidate before it is
@@ -12,7 +14,7 @@ drygate keeps coding agents from adding duplicated code. It has three parts:
 - **jscpd's MCP server**, so the agent can check a draft against the codebase before it
   writes it (Claude Code only).
 
-It works in Claude Code and Codex. It needs Node 20 or later and git. The gate does nothing
+It works in Claude Code and Codex. It needs Node 20 or later and git. The check does nothing
 outside a git repository.
 
 ## Install
@@ -49,22 +51,21 @@ once per machine, in the background; until that finishes, stops are not checked 
 A failed install, for example offline or behind a proxy npm cannot reach, is retried after
 10 minutes. To use a specific binary, set `DRYGATE_JSCPD` to its path.
 
-## How the gate decides
+## How the check decides
 
 At session start, drygate scans the working tree in a background process and counts the
 clones by the pair of files they join and by the code they repeat. At each stop it scans
-again and blocks on a clone when both its file pair and its code are more common than in
-the snapshot. After a stop that passes, the snapshot moves forward to the current tree.
+again and warns on a clone when both its file pair and its code are more common than in
+the snapshot. After every checked stop, the snapshot moves forward to the current tree, so
+each copy is reported once.
 
-- Duplication that was already there, committed or not, never blocks. Editing an old clone,
-  renaming its file or moving it does not block either.
-- A third copy of code that was already duplicated blocks.
-- A copy the agent commits before it stops still blocks. drygate compares against the
+- Duplication that was already there, committed or not, is never reported. Editing an old
+  clone, renaming its file or moving it is not reported either.
+- A third copy of code that was already duplicated is reported.
+- A copy the agent commits before it stops is still reported. drygate compares against the
   snapshot, not against `HEAD`.
 - A copy with its local names changed still counts (renamed-identifier matching).
-- After one block, the next stop is let through, the user sees what is left, and those
-  copies are accepted from then on.
-- On resume, drygate takes a new snapshot, so commits pulled in between do not block.
+- On resume, drygate takes a new snapshot, so commits pulled in between are not reported.
   Uncommitted changes since the last check stay out of it: a turn the user interrupted had
   no stop, so they are still checked.
 - A stop with no file changed since the last check skips the scan.
@@ -85,7 +86,7 @@ renamed-copy detection and any other jscpd option. drygate still adds worktrees,
 submodules and nested clones to its `ignore` list. See jscpd's
 [options](https://github.com/kucherenko/jscpd#options).
 
-To keep a deliberate duplicate, wrap it in comments the gate skips:
+To keep a deliberate duplicate out of the report, wrap it in comments the check skips:
 
 ```js
 // jscpd:ignore-start
@@ -93,17 +94,20 @@ To keep a deliberate duplicate, wrap it in comments the gate skips:
 // jscpd:ignore-end
 ```
 
-`DRYGATE_DISABLE=1` in the environment turns the gate off.
+`DRYGATE_DISABLE=1` in the environment turns the check off.
 
 ## Limits
 
-- The gate finds copies of text: exact copies, renamed copies and near-copies. It does not
+- The warning goes to the user, not to the agent: a Stop hook cannot add to the model's
+  context without blocking. In an unattended session nobody sees it; run
+  `/drygate:sweep` or review the diff instead.
+- The check finds copies of text: exact copies, renamed copies and near-copies. It does not
   find two functions that do the same thing written differently. The sweep covers part of
   that: code the standard library or a dependency already provides.
 - Removing one clone and adding a different one between the same two files, in the same
   turn, is not caught: the counts do not change.
 - A clone that existed before the session, in a file the agent edits before the start
-  snapshot finishes, counts as new and blocks once. The snapshot takes a few seconds at most,
+  snapshot finishes, counts as new and is reported once. The snapshot takes a few seconds at most,
   and in an interactive session the first edit comes after the user's first prompt.
 - The sweep reads every file in scope with a model. It reports the batch and line counts
   first and asks before sweeping more than 300,000 lines.
